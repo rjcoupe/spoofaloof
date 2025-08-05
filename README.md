@@ -142,29 +142,6 @@ Identified Vulnerabilities:
 }
 ```
 
-## Testing
-
-Run the test suite to verify functionality:
-
-```bash
-python3 run_tests.py
-```
-
-Or run tests directly with unittest:
-
-```bash
-python3 -m unittest test_spoofaloof.py -v
-```
-
-The test suite covers:
-- SPF record parsing and validation
-- DKIM selector checking
-- DMARC policy analysis
-- Vulnerability scoring algorithm
-- Additional security checks (MTA-STS, DNSSEC, etc.)
-- Report generation
-- Integration testing
-
 ## License
 
 This project is licensed under the BSD 3-Clause License - see the [LICENSE](LICENSE) file for details.
