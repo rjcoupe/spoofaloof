@@ -35,6 +35,11 @@ python3 spoofaloof.py example.com --remediate
 python3 spoofaloof.py example.com --no-color
 ```
 
+### Skip open relay testing:
+```bash
+python3 spoofaloof.py example.com --skip-open-relay
+```
+
 ## What it checks
 
 ### Core Email Authentication
@@ -50,6 +55,7 @@ python3 spoofaloof.py example.com --no-color
 8. **TLS-RPT**: Checks for TLS reporting configuration
 9. **Wildcard Records**: Detects potentially dangerous wildcard DNS entries
 10. **Subdomain Analysis**: Scans common subdomains for missing email authentication
+11. **Open Relay Testing**: Tests mail servers for open relay vulnerabilities that could be abused for spam
 
 ## Vulnerability Scoring
 
@@ -135,6 +141,29 @@ Identified Vulnerabilities:
   ]
 }
 ```
+
+## Testing
+
+Run the test suite to verify functionality:
+
+```bash
+python3 run_tests.py
+```
+
+Or run tests directly with unittest:
+
+```bash
+python3 -m unittest test_spoofaloof.py -v
+```
+
+The test suite covers:
+- SPF record parsing and validation
+- DKIM selector checking
+- DMARC policy analysis
+- Vulnerability scoring algorithm
+- Additional security checks (MTA-STS, DNSSEC, etc.)
+- Report generation
+- Integration testing
 
 ## License
 

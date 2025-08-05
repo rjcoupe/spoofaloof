@@ -3,6 +3,8 @@
 import argparse
 import json
 import sys
+import socket
+import smtplib
 import dns.resolver
 import dns.exception
 import dns.dnssec
@@ -40,6 +42,7 @@ class Spoofaloof:
             'wildcards': {'found': False, 'issues': []},
             'null_mx': {'found': False},
             'tls_rpt': {'found': False, 'record': None},
+            'open_relay': {'tested': False, 'vulnerable': False, 'tested_servers': [], 'issues': []},
             'subdomains': {'vulnerable': [], 'checked': []},
             'vulnerabilities': [],
             'risk_level': 'Unknown',
@@ -364,6 +367,101 @@ class Spoofaloof:
             except:
                 continue
     
+    def check_open_relay(self) -> None:
+        """Check for open mail relay vulnerabilities"""
+        if not self.results['mx']['found'] or not self.results['mx']['records']:
+            self.results['open_relay']['issues'].append('No MX records to test for open relay')
+            return
+        
+        self.results['open_relay']['tested'] = True
+        
+        # Test common open relay techniques on MX servers
+        test_cases = [
+            # External to external relay test
+            ('external@malicious.com', 'victim@target.com'),
+            # Percent hack
+            ('test%victim@target.com@malicious.com', 'victim@target.com'),
+            # Double at sign
+            ('test@victim@target.com', 'victim@target.com'),
+            # Source routing
+            ('@malicious.com:victim@target.com', 'victim@target.com'),
+        ]
+        
+        for mx_info in self.results['mx']['records'][:3]:  # Test up to 3 MX servers
+            mx_host = mx_info['host']
+            
+            try:
+                # Test SMTP connection with timeout
+                server = smtplib.SMTP(timeout=10)
+                server.set_debuglevel(0)  # Disable debug output
+                
+                try:
+                    server.connect(mx_host, 25)
+                    server.helo('spoofaloof-scanner.example.com')
+                    
+                    relay_vulnerable = False
+                    test_results = []
+                    
+                    for mail_from, rcpt_to in test_cases:
+                        try:
+                            server.mail(mail_from)
+                            code, response = server.rcpt(rcpt_to)
+                            
+                            # If the server accepts the recipient (2xx response),
+                            # it might be an open relay
+                            if 200 <= code < 300:
+                                relay_vulnerable = True
+                                test_results.append(f"Accepted relay: {mail_from} -> {rcpt_to}")
+                            else:
+                                test_results.append(f"Rejected relay: {mail_from} -> {rcpt_to} ({code})")
+                                
+                        except smtplib.SMTPRecipientsRefused:
+                            test_results.append(f"Rejected relay: {mail_from} -> {rcpt_to}")
+                        except smtplib.SMTPException as e:
+                            test_results.append(f"SMTP error for {mail_from} -> {rcpt_to}: {str(e)}")
+                        
+                        # Reset for next test
+                        try:
+                            server.rset()
+                        except:
+                            pass
+                    
+                    self.results['open_relay']['tested_servers'].append({
+                        'server': mx_host,
+                        'vulnerable': relay_vulnerable,
+                        'test_results': test_results
+                    })
+                    
+                    if relay_vulnerable:
+                        self.results['open_relay']['vulnerable'] = True
+                        self.results['open_relay']['issues'].append(f'Open relay detected on {mx_host}')
+                    
+                except (smtplib.SMTPException, OSError, socket.error) as e:
+                    self.results['open_relay']['tested_servers'].append({
+                        'server': mx_host,
+                        'vulnerable': False,
+                        'test_results': [f'Connection failed: {str(e)}']
+                    })
+                    
+                finally:
+                    try:
+                        server.quit()
+                    except:
+                        pass
+                        
+            except (socket.error, OSError) as e:
+                self.results['open_relay']['tested_servers'].append({
+                    'server': mx_host,
+                    'vulnerable': False,
+                    'test_results': [f'Connection failed: {str(e)}']
+                })
+                continue
+        
+        if not self.results['open_relay']['vulnerable'] and self.results['open_relay']['tested_servers']:
+            # All servers tested, none vulnerable
+            tested_count = len(self.results['open_relay']['tested_servers'])
+            self.results['open_relay']['issues'].append(f'Open relay test completed on {tested_count} server(s) - no relays detected')
+    
     def assess_vulnerabilities(self) -> None:
         """Assess overall vulnerabilities based on findings"""
         vulnerabilities = []
@@ -428,6 +526,12 @@ class Spoofaloof:
             # SPF +all with no DMARC is effectively no protection
             vulnerability_scores.append(9.0)
         
+        # Critical combination: SPF record exists but DMARC is p=none
+        if (self.results['spf']['found'] and self.results['dmarc']['found'] and 
+            self.results['dmarc']['record'] and 'p=none' in self.results['dmarc']['record'].lower()):
+            vulnerabilities.append('SPF record exists but DMARC policy is "none" - creates false security impression while providing no enforcement')
+            vulnerability_scores.append(7.5)  # Critical - false sense of security
+        
         # MX vulnerabilities
         if not self.results['mx']['found']:
             if not self.results['null_mx']['found']:
@@ -472,6 +576,11 @@ class Spoofaloof:
                 vulnerability_scores.append(3.5)  # Moderate to severe
             else:
                 vulnerability_scores.append(2.5)  # Moderate
+        
+        # Open relay vulnerabilities
+        if self.results['open_relay']['tested'] and self.results['open_relay']['vulnerable']:
+            vulnerabilities.append('Open mail relay detected - server can be abused for spam and spoofing')
+            vulnerability_scores.append(8.0)  # Critical - allows direct mail abuse
         
         # BIMI consideration (informational only)
         # Don't add BIMI to vulnerabilities since it's optional
@@ -625,6 +734,16 @@ class Spoofaloof:
         if self.results['subdomains']['vulnerable']:
             report.append(f"{Colors.YELLOW}⚠{Colors.ENDC} {len(self.results['subdomains']['vulnerable'])} vulnerable subdomain(s) found")
         
+        # Open Relay
+        if self.results['open_relay']['tested']:
+            if self.results['open_relay']['vulnerable']:
+                report.append(f"{Colors.RED}✗{Colors.ENDC} Open mail relay detected - server vulnerable to abuse")
+            else:
+                tested_count = len(self.results['open_relay']['tested_servers'])
+                report.append(f"{Colors.GREEN}✓{Colors.ENDC} No open relays detected ({tested_count} server(s) tested)")
+        else:
+            report.append(f"{Colors.BLUE}◯{Colors.ENDC} Open relay test skipped (no MX records)")
+        
         report.append("")
         
         # Vulnerabilities Summary
@@ -681,7 +800,26 @@ class Spoofaloof:
                 report.append("Update your DMARC policy from 'none' to 'quarantine' or 'reject':")
                 report.append("  Current: v=DMARC1; p=none; ...")
                 report.append("  Change to: v=DMARC1; p=quarantine; ...")
+                if self.results['spf']['found']:
+                    report.append("  WARNING: Having SPF with DMARC p=none creates false security!")
+                    report.append("  Recipients may think emails are authenticated when they're not enforced.")
                 remediation_shown.add('dmarc_weak')
+            
+            # Special case: SPF exists with DMARC p=none (dangerous combination)
+            if (self.results['spf']['found'] and self.results['dmarc']['found'] and 
+                self.results['dmarc']['record'] and 'p=none' in self.results['dmarc']['record'].lower() and
+                'spf_dmarc_none_combo' not in remediation_shown):
+                report.append("\nDANGEROUS: SPF + DMARC p=none Combination:")
+                report.append("Your domain has SPF records but DMARC is set to 'none' - this is misleading!")
+                report.append("  • Recipients see SPF authentication and may trust emails")
+                report.append("  • But DMARC p=none means no action is taken on failures")
+                report.append("  • Attackers can spoof your domain and still get delivered")
+                report.append("  • This creates a FALSE SENSE OF SECURITY")
+                report.append("Immediate action required:")
+                report.append("  • Change DMARC policy to 'quarantine' to start blocking spoofed emails")
+                report.append("  • Monitor DMARC reports for legitimate email failures")
+                report.append("  • Gradually move to 'reject' policy for maximum protection")
+                remediation_shown.add('spf_dmarc_none_combo')
             
             # MTA-STS remediation
             if not self.results['mta_sts']['found'] and 'mta_sts_missing' not in remediation_shown:
@@ -740,11 +878,23 @@ class Spoofaloof:
                     report.append("3. Consider getting a Verified Mark Certificate (VMC) for enhanced trust")
                     remediation_shown.add('bimi_missing')
             
+            # Open relay remediation
+            if self.results['open_relay']['vulnerable'] and 'open_relay' not in remediation_shown:
+                report.append("\nOpen Mail Relay Detected:")
+                report.append("Immediately secure your mail server configuration:")
+                report.append("  • Configure the mail server to reject external-to-external relaying")
+                report.append("  • Restrict relay permissions to authenticated users only")
+                report.append("  • Review SMTP server configuration (Postfix, Sendmail, Exchange, etc.)")
+                report.append("  • Consider implementing SMTP authentication (SASL)")
+                report.append("  • Test configuration using external relay testing tools")
+                report.append("  • Monitor mail server logs for abuse attempts")
+                remediation_shown.add('open_relay')
+            
             report.append("")
         
         return "\n".join(report)
     
-    def run(self) -> Dict:
+    def run(self, skip_open_relay: bool = False) -> Dict:
         """Run all checks and return results"""
         self.check_spf()
         self.check_dkim()
@@ -757,6 +907,8 @@ class Spoofaloof:
         self.check_dnssec()
         self.check_wildcards()
         self.check_subdomains()
+        if not skip_open_relay:
+            self.check_open_relay()
         self.assess_vulnerabilities()
         return self.results
 
@@ -769,6 +921,7 @@ def main():
     parser.add_argument('--json', action='store_true', help='Output results as JSON')
     parser.add_argument('--no-color', action='store_true', help='Disable colored output')
     parser.add_argument('--remediate', action='store_true', help='Include basic remediation instructions')
+    parser.add_argument('--skip-open-relay', action='store_true', help='Skip open relay testing (faster, less intrusive)')
     
     args = parser.parse_args()
     
@@ -790,7 +943,7 @@ def main():
     
     try:
         # Run checks
-        results = checker.run()
+        results = checker.run(skip_open_relay=args.skip_open_relay)
         
         # Output results
         if args.json:
