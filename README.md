@@ -19,9 +19,11 @@ python3 -m pip install -r requirements.txt
 
 Only assess domains and infrastructure you own or have permission to test. Include third-party mail hosting in the agreed scope; permission to inspect a domain does not automatically cover its provider's SMTP servers.
 
-**SMTP probing is enabled by default.** Alongside DNS queries, the tool connects to TCP port 25 on up to the first three returned MX hosts, with a 10-second socket timeout. It sends `HELO`, `MAIL FROM`, `RCPT TO`, `RSET` and `QUIT` commands using four hard-coded envelope-address cases. These include external addresses that are not configurable through the CLI. It does **not** issue `DATA` or submit a message body, but it does actively contact mail servers and may trigger logging or alerts.
+**SMTP probing is disabled by default.** Normal runs perform DNS queries only. Use `--probe-smtp` only when active SMTP testing is explicitly in scope. The legacy `--skip-open-relay` flag remains accepted as an explicit DNS-only choice and cannot be combined with `--probe-smtp`.
 
-Use `--skip-open-relay` for DNS-only checks. This disables SMTP connections, not DNS traffic. Omit the flag only when active SMTP testing is explicitly in scope.
+When enabled, the tool connects to TCP port 25 on up to the first three usable returned MX hosts, with a 10-second socket timeout. It sends `HELO`, `MAIL FROM`, `RCPT TO`, `RSET` and `QUIT` commands using four hard-coded envelope-address cases. These include external addresses that are not configurable through the CLI. It does **not** issue `DATA` or submit a message body, but it actively contacts mail servers and may trigger logging or alerts.
+
+The Python API also defaults to DNS-only: `checker.run()`. Explicit `checker.run(probe_smtp=True)` opts in. For compatibility, explicitly passing `skip_open_relay=False` also opts in; existing callers using that argument should review their scope.
 
 ## Usage
 
@@ -39,30 +41,40 @@ python3 spoofaloof.py "$DOMAIN" --skip-open-relay --json > report.json
 # Text report with basic remediation suggestions and no ANSI colors
 python3 spoofaloof.py "$DOMAIN" --skip-open-relay --remediate --no-color
 
+# Query known selectors instead of the common-selector guesses (repeatable)
+python3 spoofaloof.py "$DOMAIN" --dkim-selector rotated.2026 --dkim-selector other
+
+# Active SMTP envelope testing, only with explicit authorization
+python3 spoofaloof.py "$DOMAIN" --probe-smtp
+
 # All available options (does not run checks)
 python3 spoofaloof.py --help
 ```
 
-`--remediate` adds suggestions to the text report; it does not change DNS or server configuration, and does not add remediation fields to JSON. Review suggestions against your actual mail flows before applying them.
+`--remediate` adds evidence-aware review guidance to the text report; it does not change DNS or server configuration, and does not add remediation fields to JSON. Review suggestions against your actual mail flows before applying them.
 
 ## What it checks
 
 | Check | Current implementation |
 | --- | --- |
 | SPF | Finds `v=spf1` TXT records; flags selected policy patterns and multiple records; estimates DNS lookups from strings in the first record. |
-| DKIM | Queries 67 fixed common selectors at `<selector>._domainkey.<domain>` and recognizes TXT records containing `v=DKIM1` or `k=rsa`. |
+| DKIM | Queries supplied selectors or 67 common guesses at `<selector>._domainkey.<domain>`. Discovers nonempty `p=` records for RSA/Ed25519, including an omitted optional version tag; key validity is not tested. |
 | DMARC | Looks for `v=DMARC1` at `_dmarc.<domain>` and checks policy, subdomain-policy and percentage strings. |
 | MX / null MX | Lists MX hosts, flags hosts within the assessed domain, and separately checks for a null MX record. |
 | MTA-STS | Looks for a `v=STSv1` TXT record at `_mta-sts.<domain>` and an `id=` field. |
-| DNSSEC | Looks for DNSKEY records, then performs an ordinary A lookup. This is not cryptographic DNSSEC validation. |
+| DNSSEC | Discovers DNSKEY records only. `validated` is always `null`; no signature or trust-chain validation is performed. |
 | BIMI / TLS-RPT | Looks for BIMI TXT records at `default._bimi` and `_bimi`, and TLS-RPT at `_smtp._tls`. These do not contribute to the score. |
 | Wildcards | Queries the literal `*.<domain>` for A and MX records. |
 | Subdomains | Tries 11 fixed names; flags those with an A response and neither a local SPF nor a local DMARC record. |
-| SMTP relay | Unless skipped, treats a 2xx response to any tested `RCPT TO` as a potential relay finding. No end-to-end relay delivery is attempted. |
+| SMTP relay | Only with explicit opt-in, treats a 2xx `RCPT TO` response after accepted `MAIL FROM` as a potential relay finding. Connection failures and temporary errors remain inconclusive; no delivery is attempted. |
 
 ### Selector and subdomain coverage
 
-DKIM selectors include `default`, `selector1`, `selector2`, `google` and provider-specific guesses. The complete list is in `check_dkim()` in [spoofaloof.py](spoofaloof.py). There is no custom-selector CLI option. Custom, rotated or otherwise unlisted selectors can be missed; **no common-selector match does not mean DKIM is absent**. Obtain the actual selector from the mail provider or a legitimate message's `DKIM-Signature` header, then verify that record and the signature separately. The JSON field `dkim.selectors_checked` contains successful matches, not every attempted selector.
+The default guesses include `default`, `selector1`, `selector2`, `google` and provider-specific names; see `check_dkim()` in [spoofaloof.py](spoofaloof.py). Repeat `--dkim-selector` to query known selectors **instead of** those guesses. Dotted selectors are supported; invalid or empty DNS labels are rejected before queries run.
+
+Selectors cannot generally be enumerated. Custom, rotated or otherwise unlisted selectors can be missed; **no selector match does not mean DKIM is absent** and adds no score penalty. Obtain actual selectors from the provider or a legitimate message's `DKIM-Signature` header, then verify the keys and signatures separately. Empty `p=` values are reported as revoked keys, not usable matches.
+
+For compatibility, `dkim.selectors_checked` retains successful record matches. `selectors_attempted` lists every queried selector; `errors` preserves lookup failures; `status` distinguishes `ok`, `partial`, `no_match` and `error`. `coverage_complete` stays false even when a key is discovered.
 
 Subdomain coverage is limited to `mail`, `email`, `smtp`, `mx`, `webmail`, `autodiscover`, `cpanel`, `webdisk`, `ftp`, `cpcalendars` and `cpcontacts`. It is not asset discovery, and A-only existence checks can miss other mail-relevant names.
 
@@ -77,7 +89,8 @@ raw score = 0.7 × highest weight + 0.3 × mean of all weights
 if highest weight >= 8.0: apply a minimum score of 8.0
 else if highest weight >= 7.0: apply a minimum score of 7.0
 cap at 10.0, then round to one decimal place
-no scored signals: 0.0
+no scored signals with at least one completed core observation: 0.0
+no completed core observation and no scored signals: null / Unknown
 ```
 
 Selected weights in the current implementation:
@@ -86,14 +99,16 @@ Selected weights in the current implementation:
 | --- | ---: |
 | SPF not found / SPF `+all` / SPF `?all` | 7.0 / 8.5 / 6.0 |
 | Multiple SPF records | 3.0 |
-| No DKIM match among common selectors | 4.0 |
+| No DKIM match among queried selectors | Unscored: deployment unknown |
 | DMARC not found | 7.5 |
 | SPF and DMARC both not found | Additional 9.5 |
 | SPF `+all` with no DMARC | Additional 9.0 |
-| SPF found and DMARC record contains `p=none` | Additional 7.5 |
+| SPF found and exact DMARC `p` tag is `none` | Additional 7.5 |
+| DMARC `p=none` / `sp=none` / valid `pct` below 100 | 6.5 / 5.0 / 4.0 |
+| Estimated SPF lookups: 7–10 / above 10 | 2.0 / 4.0 |
 | MX host within the assessed domain | 2.0 per flagged host |
 | MTA-STS TXT record not found | 3.5 |
-| DNSKEY not found | 4.0 |
+| DNSKEY not found after a completed lookup | 4.0 (discovery heuristic only) |
 | Wildcard A / MX record | 3.0 / 7.0 |
 | Flagged subdomains: 1–2 / 3–4 / 5 or more | 2.5 / 3.5 / 5.0 |
 | Potential relay acceptance | 8.0 |
@@ -107,23 +122,23 @@ Combination weights are appended alongside individual weights, not substituted o
 | 4.1–7.0 | High |
 | 7.1–10.0 | Critical |
 
-### Current scoring caveats
+### Evidence, unknowns and compatibility
 
-Issue-to-score mapping uses string matching rather than structured findings. In particular:
+`score_method` is `heuristic-v2-observed-signals`. `score_signals` exposes each contributing check, weight and evidence, so the result can be audited. The formula and bands are retained, but signal handling changed: DKIM discovery misses and unperformed DNSSEC validation are unscored, DNS errors do not become missing-control penalties, SPF estimates of 7–10 receive 2.0 rather than 4.0, and exact DMARC tags drive the policy weights. `sp=none` no longer triggers the separate `p=none` combination.
 
-- An SPF estimate of 7–10 lookups produces an “approaching limit” issue, but currently receives the same 4.0 weight and “exceeds” summary as an estimate above 10.
-- The normal DMARC `p=none`, `sp=none` and partial-percentage warning text does not match its corresponding scoring branches. The separate SPF-plus-`p=none` combination still applies; its substring check can also match `sp=none`.
-- Some issues are unscored. A lower score or an empty vulnerability list does not mean every check passed. Skipping SMTP adds no score penalty and leaves relay behavior unknown.
+Core DNS checks distinguish a completed query (`ok`), negative answer (`absent`), lookup failure (`error`) and an unrun check (`not_checked`). A completed TXT query can still contain no relevant policy; inspect `found` with `status`. Multi-query checks preserve failures in `errors`. Unknowns are unscored, so **incomplete evidence can lower a score**. `assessment_incomplete` is always true because this tool never verifies end-to-end authentication or delivery; read `limitations`, per-check `issues`, and `errors` alongside the score.
 
-Review the per-check records and `issues`, not only the score or generated vulnerability wording.
+JSON consumers must handle `vulnerability_score: null` and `risk_level: "Unknown"` when no core scored checks completed and no signals were observed. `dnssec.validated` is always `null`; `dnssec.signed` is only a legacy DNSKEY-discovery flag and is `null` on lookup error. `open_relay.vulnerable` is `null` when skipped or inconclusive, `true` for potential acceptance, and `false` only when all sampled envelope cases were rejected. Neither boolean proves message-delivery behavior. The text report mirrors these states and provides review guidance rather than unsupported enforcement assurances.
+
+Compare scores only with the tool revision, method, queried selectors and scope recorded. Results from the prior scoring implementation are not directly comparable without reviewing the signal set.
 
 ## Limitations and interpretation
 
-- **DNS observations are a snapshot.** Resolver failures can be reported as missing configuration or silently skipped by some checks. Record the resolver, time and raw responses when validating a finding; distinguish absence from lookup failure.
+- **DNS observations are a snapshot.** Core lookup failures are recorded separately from negative answers; even negative answers depend on the resolver and queried name. Record the resolver, time and raw responses when validating a finding; distinguish absence from lookup failure.
 - **SPF analysis is approximate.** It does not evaluate a sender IP or recursively follow `include` / `redirect` records, and its string-based lookup count is not an RFC-complete evaluation. See [SPF DNS lookup limits](https://www.rfc-editor.org/rfc/rfc7208.html#section-4.6.4).
-- **Record discovery is not message authentication.** DKIM key validity, actual signing, signature verification and SPF/DKIM alignment with the visible From domain are not tested. DMARC checks are simple string checks, not a full policy parser or organizational-domain discovery process. Parent DMARC policy may apply to a subdomain; a missing local record or `sp` tag alone does not establish lack of protection. See [DMARC policy discovery](https://www.rfc-editor.org/rfc/rfc7489.html#section-6.6.3).
-- **Transport and DNS checks are limited.** MTA-STS checks do not fetch the HTTPS policy or test TLS/certificates; `mta_sts.policy` holds the DNS TXT string. DNSSEC's `validated` field does not establish a validated signature chain. In particular, the text report's “enforces TLS” and “DNSSEC is properly configured” wording exceeds what these checks establish. See [MTA-STS policy validation](https://www.rfc-editor.org/rfc/rfc8461.html#section-4).
-- **Relay results need corroboration.** RCPT acceptance alone does not prove that a server will relay a completed message. Conversely, connection failure is not a clean result: inspect `open_relay.tested_servers[].test_results`, even if `tested` is true and `vulnerable` is false. When explicitly skipped, the text report still says “no MX records”; use the command flags and JSON `tested` field to establish test scope.
+- **Record discovery is not message authentication.** DKIM key validity, actual signing, signature verification and SPF/DKIM alignment with the visible From domain are not tested. DMARC scoring uses exact semicolon-delimited tags, but this is not a full policy validator or organizational-domain discovery process. Parent DMARC policy may apply to a subdomain; a missing local record or `sp` tag alone does not establish lack of protection. See [DMARC policy discovery](https://www.rfc-editor.org/rfc/rfc7489.html#section-6.6.3).
+- **Transport and DNS checks are limited.** MTA-STS checks do not fetch the HTTPS policy or test TLS/certificates; `mta_sts.policy` holds the DNS TXT string. DNSSEC's `validated` field remains `null`; neither DNSKEY presence nor absence at the queried name establishes a validated chain or a zone's security. See [MTA-STS policy validation](https://www.rfc-editor.org/rfc/rfc8461.html#section-4).
+- **Relay results need corroboration.** RCPT acceptance alone does not prove that a server will relay a completed message. Connection failures, failed SMTP preconditions and temporary replies are inconclusive. Inspect `status`, `tested` and `open_relay.tested_servers[].test_results`. `not_observed` describes only the sampled envelope cases; no server receives a message body.
 - **Context matters.** Self-hosted MX, wildcard DNS or a missing optional control does not by itself prove spoofability. The tool does not assess display-name spoofing, lookalike domains, receiver-specific filtering or successful delivery. Treat generated remediation as a starting point, not a deployment plan.
 
 ## Worked example: finding, remediation and retest
@@ -152,20 +167,22 @@ Illustrative JSON excerpt (selected fields only):
   "dmarc": {
     "found": false,
     "record": null,
-    "issues": ["DNS lookup failed for DMARC record"]
+    "status": "absent",
+    "issues": ["No DMARC record found"]
   },
   "open_relay": {
     "tested": false,
-    "vulnerable": false,
+    "vulnerable": null,
+    "status": "skipped",
     "tested_servers": [],
     "issues": []
   }
 }
 ```
 
-For an absent TXT answer, the current checker emits the generic DNS-lookup issue shown above. In a real assessment, distinguish confirmed record absence from a resolver problem before raising this finding; this scenario assumes the owned lab zone confirms absence.
+An absent TXT answer is distinct from a resolver failure (`status: "error"`). This scenario assumes a negative answer corroborated by the owned lab zone.
 
-The contributing weights are `[7.5, 3.5, 4.0]`: the weighted calculation is 6.75, raised to the 7.0 floor. `vulnerable: false` here does not mean relay testing passed; `tested: false` means it was not performed.
+The contributing weights are `[7.5, 3.5, 4.0]`: the weighted calculation is 6.75, raised to the 7.0 floor. `vulnerable: null` and `tested: false` mean relay testing was not performed.
 
 ### 2. Remediation plan
 
@@ -194,12 +211,23 @@ python3 spoofaloof.py "$DOMAIN" --skip-open-relay --json > after.json
 | Evidence | Illustrative before | Expected after, with all other inputs unchanged |
 | --- | --- | --- |
 | DMARC record | Not found | `v=DMARC1; p=reject; sp=reject; pct=100` |
-| DMARC issues | `DNS lookup failed for DMARC record` | Empty list |
+| DMARC issues | `No DMARC record found` | Empty list |
 | Scoring weights | `[7.5, 3.5, 4.0]` | `[3.5, 4.0]` |
 | Tool score / label | **7.0 / High** | **3.9 / Medium** |
 | SMTP relay coverage | Skipped | Skipped |
 
 The expected 3.9 score reflects remaining MTA-STS and DNSSEC signals, not a failed DMARC fix. Close the configuration finding only after confirming the intended DNS policy and independently checking legitimate-mail authentication plus handling of controlled, failing messages at owned receivers. Preserve timestamps, tool revision, command flags, raw DNS evidence and relevant receiver headers/logs. A changed score alone is not proof of enforcement or successful remediation.
+
+## Offline tests
+
+After installing the dependency, run:
+
+```bash
+python3 -m unittest discover -s tests -v
+python3 -m py_compile spoofaloof.py
+```
+
+Tests replace the DNS resolver and SMTP transport with controlled fixtures. They never probe external domains or mail servers. Coverage includes default/opt-in CLI behavior, custom and revoked DKIM selectors, DNS failures versus absence, truthful DNSSEC/MTA-STS output, SMTP transaction outcomes, scoring evidence and synthetic before/after scores.
 
 ## License
 
